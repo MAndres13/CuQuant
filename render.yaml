@@ -2,10 +2,12 @@ services:
   - type: web
     name: cuquant-dashboard
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
     startCommand: gunicorn integrated_dashboard:app --bind 0.0.0.0:$PORT
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.7
+        value: 3.11.9
       - key: PORT
         value: 10000
