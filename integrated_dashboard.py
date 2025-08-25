@@ -738,6 +738,46 @@ def favicon():
     """Serve favicon to prevent 404 errors."""
     return '', 204  # No content response
 
+@app.route('/static/js/websocket_client_silent.js')
+def websocket_client():
+    """Serve WebSocket client to prevent 404 errors."""
+    # Return a minimal WebSocket client script
+    client_script = """
+// Minimal WebSocket client for CuQuant Dashboard
+console.log('WebSocket client loaded');
+
+// Initialize WebSocket connection if needed
+function initWebSocket() {
+    if (typeof io !== 'undefined') {
+        const socket = io();
+        
+        socket.on('connect', function() {
+            console.log('WebSocket connected');
+        });
+        
+        socket.on('disconnect', function() {
+            console.log('WebSocket disconnected');
+        });
+        
+        socket.on('price_update', function(data) {
+            console.log('Price update received:', data);
+            // Handle price updates here
+        });
+        
+        return socket;
+    }
+    return null;
+}
+
+// Auto-initialize when DOM is ready
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initWebSocket);
+} else {
+    initWebSocket();
+}
+"""
+    return client_script, 200, {'Content-Type': 'application/javascript'}
+
 @app.route('/api/status')
 def api_status():
     """API endpoint to check system status."""
