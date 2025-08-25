@@ -1,0 +1,19 @@
+# Core Flask dependencies
+Flask==2.3.3
+Flask-SocketIO==5.3.6
+python-socketio==5.8.0
+
+# Data processing
+pandas==2.0.3
+numpy==1.24.3
+yfinance==0.2.18
+
+# HTTP requests
+requests==2.31.0
+
+# Production server
+gunicorn==21.2.0
+
+# Build tools (to resolve setuptools issues)
+setuptools==68.2.2
+wheel==0.41.2
