@@ -1048,7 +1048,13 @@
             // Update header change display
             const headerChangeElement = document.getElementById('header-change');
             if (headerChangeElement) {
-                const changePercent = data.change_percent || data.change || 0;
+                // Always use percent for header change; if missing, compute from change/price
+                let changePercent = 0;
+                if (typeof data.change_percent === 'number') {
+                    changePercent = data.change_percent;
+                } else if (typeof data.change === 'number' && typeof data.price === 'number' && data.price !== 0) {
+                    changePercent = (data.change / (data.price - data.change)) * 100;
+                }
                 const changeText = changePercent >= 0 ? `+${changePercent.toFixed(2)}%` : `${changePercent.toFixed(2)}%`;
                 headerChangeElement.textContent = changeText;
                 
