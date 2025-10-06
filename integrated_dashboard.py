@@ -73,6 +73,9 @@ if websocket_available:
 else:
     socketio = SocketIO(app, cors_allowed_origins="*")
 
+# Ensure background updates also run when served via Gunicorn (not __main__)
+_background_task_started = False
+
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -913,6 +916,15 @@ def background_update_thread():
 def handle_connect():
     """Handle client connection."""
     logger.info("Client connected")
+    global _background_task_started
+    try:
+        if not _background_task_started:
+            # Start periodic updates in the background when the first client connects
+            socketio.start_background_task(background_update_thread)
+            _background_task_started = True
+            logger.info("Started background update task from connect handler")
+    except Exception as e:
+        logger.error(f"Failed to start background task: {e}")
     
     # Send initial data
     try:
