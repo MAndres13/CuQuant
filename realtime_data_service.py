@@ -91,24 +91,51 @@ class RealTimeDataService:
             # Use copper futures symbol
             copper = yf.Ticker("HG=F")  # COMEX Copper Futures
             
-            # Get current data
-            info = copper.info
-            hist = copper.history(period="1d", interval="1m")
-            
+            # Try multiple sources to get the most recent trade price
+            info = {}
+            try:
+                # Some environments block .info; ignore failures
+                info = copper.info or {}
+            except Exception:
+                info = {}
+
+            # Prefer fast_info when available
+            fast_info_price = None
+            try:
+                fast_info = getattr(copper, 'fast_info', None)
+                if fast_info and getattr(fast_info, 'last_price', None):
+                    fast_info_price = float(fast_info.last_price)
+            except Exception:
+                fast_info_price = None
+
+            # Intraday history with broader window to reduce empties
+            hist = copper.history(period="5d", interval="1m")
+            if hist.empty:
+                hist = copper.history(period="5d", interval="5m")
+            if hist.empty:
+                hist = copper.history(period="1mo", interval="1h")
             if hist.empty:
                 # Fallback to daily data
                 hist = copper.history(period="5d")
-            
-            current_price = hist['Close'].iloc[-1]
-            previous_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+
+            # Determine current and previous prices
+            if not hist.empty:
+                current_price = float(hist['Close'].iloc[-1])
+                previous_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current_price
+            elif fast_info_price is not None:
+                current_price = fast_info_price
+                previous_close = fast_info_price
+            else:
+                # As a last resort, use fallback
+                return self._get_fallback_copper_data()
             
             change = current_price - previous_close
             change_percent = (change / previous_close) * 100 if previous_close != 0 else 0
             
             # Get additional data
-            volume = hist['Volume'].iloc[-1] if 'Volume' in hist.columns else 0
-            high = hist['High'].max()
-            low = hist['Low'].min()
+            volume = hist['Volume'].iloc[-1] if (not hist.empty and 'Volume' in hist.columns) else 0
+            high = float(hist['High'].max()) if not hist.empty else current_price
+            low = float(hist['Low'].min()) if not hist.empty else current_price
             
             market_data = MarketData(
                 symbol="HG=F",
