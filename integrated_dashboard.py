@@ -12,12 +12,6 @@ import random
 from flask_socketio import SocketIO
 
 try:
-    from websocket_server import setup_websocket
-    websocket_available = True
-except ImportError:
-    websocket_available = False
-
-try:
     from monte_carlo_service import run_simulation_api
     monte_carlo_available = True
 except ImportError:
@@ -68,13 +62,10 @@ TEMPLATES_DIR = os.path.join(PROJECT_DIR, 'templates')
 app = Flask(__name__, template_folder=TEMPLATES_DIR, static_folder='static')
 app.config['SECRET_KEY'] = 'copper-quant-secret-key'
 
-if websocket_available:
-    socketio = setup_websocket(app)
-else:
-    socketio = SocketIO(app, cors_allowed_origins="*")
-
-# Ensure background updates also run when served via Gunicorn (not __main__)
+# Event handlers and the single update loop are registered in this module.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 _background_task_started = False
+_background_task_lock = threading.Lock()
 
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -120,50 +111,14 @@ def get_latest_copper_price():
             result = get_live_copper_price()
             if result['success']:
                 data = result['data']
-                return {
-                    'symbol': data['symbol'],
-                    'price': data['price'],
-                    'change': data['change'],
-                    'change_percent': data['change_percent'],
-                    'high': data['high'],
-                    'low': data['low'],
-                    'volume': data['volume'],
-                    'timestamp': data['timestamp']
-                }
+                return data
         except Exception as e:
-            logger.warning(f"⚠️ Real-time data failed, using fallback: {e}")
-    
-    # Fallback to simulated data
-    import random
-    import time
-    
-    current_time = int(time.time() / 10)
-    random.seed(current_time)
-    
-    time_factor = (current_time % 8640) / 8640
-    daily_trend = 0.05 * np.sin(time_factor * 2 * np.pi)
-    
-    base_price = 5.84 + daily_trend
-    volatility = random.uniform(-0.08, 0.08)
-    current_price = base_price + volatility
-    current_price = max(5.75, min(5.95, current_price))
-    
-    prev_price = 5.84
-    change = current_price - prev_price
-    change_percent = (change / prev_price) * 100
-    
-    high = current_price + random.uniform(0.01, 0.04)
-    low = current_price - random.uniform(0.01, 0.04)
-    
+            logger.warning("Yahoo price unavailable: %s", e)
     return {
-        "symbol": "COMEX: HGW00",
-        "price": round(current_price, 2),
-        "change": round(change, 2),
-        "change_percent": round(change_percent, 2),
-        "high": round(high, 2),
-        "low": round(low, 2),
-        "volume": f"{random.randint(14000, 18000):,}",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "symbol": "HG=F", "price": 5.84, "change": 0.0,
+        "change_percent": 0.0, "high": 5.84, "low": 5.84,
+        "volume": "N/A", "timestamp": "Unavailable",
+        "source": "Demo", "status": "unavailable",
     }
 
 def get_related_assets():
@@ -918,11 +873,10 @@ def handle_connect():
     logger.info("Client connected")
     global _background_task_started
     try:
-        if not _background_task_started:
-            # Start periodic updates in the background when the first client connects
-            socketio.start_background_task(background_update_thread)
-            _background_task_started = True
-            logger.info("Started background update task from connect handler")
+        with _background_task_lock:
+            if not _background_task_started:
+                socketio.start_background_task(background_update_thread)
+                _background_task_started = True
     except Exception as e:
         logger.error(f"Failed to start background task: {e}")
     
@@ -1388,12 +1342,6 @@ def api_trading_performance():
 
 if __name__ == '__main__':
     initialize_ml_system_on_startup()
-    real_time_enabled = start_real_time_updates()
-    
-    if not real_time_enabled:
-        update_thread = threading.Thread(target=background_update_thread, daemon=True)
-        update_thread.start()
-    
     socketio.run(app, debug=False, port=8082, allow_unsafe_werkzeug=True)
 @app.route('/api/performance-comparison')
 def api_performance_comparison():

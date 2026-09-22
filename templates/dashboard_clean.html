@@ -610,26 +610,27 @@
             </div>
 
             <div class="card">
-                <h2>Live Market Price</h2>
+                <h2>Copper Futures Price</h2>
                 <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 20px;">
-                    <span class="status-indicator status-live"></span>
-                    <span style="font-size: 0.9em; color: #666;">COMEX: HG=F</span>
+                    <span class="status-indicator" data-feed-indicator></span>
+                    <span style="font-size: 0.9em; color: #666;" data-feed-status>HG=F · {% if copper_price.get("status") == "unavailable" %}Yahoo Finance unavailable{% elif copper_price.get("status") == "stale" %}Showing last saved Yahoo quote{% else %}Yahoo Finance · latest available quote (may be delayed){% endif %}</span>
                 </div>
-                <div class="price-display" data-price-display>${{ copper_price.get('price', 'N/A') }}</div>
+                <div class="price-display" data-price-display>{% if copper_price.get('status') == 'unavailable' %}Unavailable{% else %}${{ copper_price.get('price', 'N/A') }}{% endif %}</div>
                 <div class="price-change {% if copper_price.get('change_percent', 0)|float > 0 %}positive{% elif copper_price.get('change_percent', 0)|float < 0 %}negative{% endif %}" style="text-align: center; font-size: 1.2em; font-weight: 600; margin-bottom: 30px;" data-change-display>
+                    {% if copper_price.get('status') == 'unavailable' %}Waiting for a Yahoo Finance quote{% else %}
                     <span class="change-amount">${{ copper_price.get('change', 0)|float|round(2) }}</span>
-                    <span class="change-percent">({% if copper_price.get('change_percent', 0)|float > 0 %}+{% endif %}{{ copper_price.get('change_percent', 0)|float|round(2) }}%)</span>
+                    <span class="change-percent">({% if copper_price.get('change_percent', 0)|float > 0 %}+{% endif %}{{ copper_price.get('change_percent', 0)|float|round(2) }}%)</span>{% endif %}
                 </div>
                 
                 <!-- Live Market Data -->
                 <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 30px;">
                     <div style="text-align: center; padding: 15px; background: #f8fafc; border-radius: 12px;">
                         <div style="font-size: 0.85em; color: #666; margin-bottom: 5px;">Daily High</div>
-                        <div style="font-size: 1.4em; font-weight: 600; color: var(--success-color);" data-high-display>${{ copper_price.get('high', 'N/A') }}</div>
+                        <div style="font-size: 1.4em; font-weight: 600; color: var(--success-color);" data-high-display>{% if copper_price.get('status') == 'unavailable' %}N/A{% else %}${{ copper_price.get('high', 'N/A') }}{% endif %}</div>
                     </div>
                     <div style="text-align: center; padding: 15px; background: #f8fafc; border-radius: 12px;">
                         <div style="font-size: 0.85em; color: #666; margin-bottom: 5px;">Daily Low</div>
-                        <div style="font-size: 1.4em; font-weight: 600; color: var(--accent-color);" data-low-display>${{ copper_price.get('low', 'N/A') }}</div>
+                        <div style="font-size: 1.4em; font-weight: 600; color: var(--accent-color);" data-low-display>{% if copper_price.get('status') == 'unavailable' %}N/A{% else %}${{ copper_price.get('low', 'N/A') }}{% endif %}</div>
                     </div>
                     <div style="text-align: center; padding: 15px; background: #f8fafc; border-radius: 12px;">
                         <div style="font-size: 0.85em; color: #666; margin-bottom: 5px;">Volume</div>
