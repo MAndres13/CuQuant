@@ -13,12 +13,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import threading
 import json
-from alpha_vantage.timeseries import TimeSeries
-from alpha_vantage.fundamentaldata import FundamentalData
-from fredapi import Fred
 import asyncio
-import websockets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +31,8 @@ class MarketData:
     high: float
     low: float
     timestamp: str
+    source: str = "Yahoo Finance"
+    status: str = "available"
     market_cap: Optional[float] = None
     pe_ratio: Optional[float] = None
 
@@ -64,10 +62,9 @@ class RealTimeDataService:
         self.fred_key = fred_key
         
         # Initialize API clients
-        self.ts = TimeSeries(key=self.alpha_vantage_key, output_format='pandas')
-        self.fd = FundamentalData(key=self.alpha_vantage_key, output_format='pandas')
         
         if self.fred_key:
+            from fredapi import Fred
             self.fred = Fred(api_key=self.fred_key)
         else:
             self.fred = None
@@ -76,7 +73,11 @@ class RealTimeDataService:
         # Cache for data
         self.cache = {}
         self.cache_expiry = {}
-        self.cache_duration = 60  # Cache for 60 seconds
+        self.cache_duration = 60  # Share requests across clients for 60 seconds
+        self._copper_lock = threading.Lock()
+        self._last_copper = None
+        self._copper_result = None
+        self._copper_checked = float("-inf")
         
         # WebSocket connections
         self.websocket_clients = set()
@@ -84,80 +85,65 @@ class RealTimeDataService:
         logger.info("✅ Real-time data service initialized")
     
     def get_copper_price_live(self) -> MarketData:
-        """
-        Get live copper price from Yahoo Finance
-        """
-        try:
-            # Use copper futures symbol
-            copper = yf.Ticker("HG=F")  # COMEX Copper Futures
-            
-            # Try multiple sources to get the most recent trade price
-            info = {}
+        """Fetch a Yahoo quote once per cache interval, retaining genuine data on failure."""
+        with self._copper_lock:
+            if time.monotonic() - self._copper_checked < self.cache_duration:
+                return self._copper_result
             try:
-                # Some environments block .info; ignore failures
-                info = copper.info or {}
-            except Exception:
-                info = {}
+                copper = yf.Ticker("HG=F")
+                hist = pd.DataFrame()
+                for period, interval in (("5d", "1m"), ("5d", "5m"), ("5d", "1d")):
+                    try:
+                        candidate = copper.history(
+                            period=period, interval=interval, auto_adjust=False, timeout=10
+                        )
+                        if not candidate.empty:
+                            candidate = candidate.replace([np.inf, -np.inf], np.nan)
+                            candidate = candidate.dropna(subset=["Close"])
+                            candidate = candidate[candidate["Close"] > 0]
+                        if not candidate.empty:
+                            hist = candidate
+                            break
+                    except Exception as exc:
+                        logger.warning("Yahoo %s history failed: %s", interval, exc)
+                if hist.empty:
+                    raise ValueError("Yahoo returned no valid copper prices")
 
-            # Prefer fast_info when available
-            fast_info_price = None
-            try:
-                fast_info = getattr(copper, 'fast_info', None)
-                if fast_info and getattr(fast_info, 'last_price', None):
-                    fast_info_price = float(fast_info.last_price)
-            except Exception:
-                fast_info_price = None
+                current_price = float(hist["Close"].iloc[-1])
+                quote_time = hist.index[-1]
+                # Daily candles define trading sessions, including overnight futures.
+                daily = hist if interval == "1d" else copper.history(
+                    period="5d", interval="1d", auto_adjust=False, timeout=10
+                )
+                daily = daily.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+                if len(daily) < 2:
+                    raise ValueError("Yahoo returned insufficient daily session data")
+                previous_close = float(daily["Close"].iloc[-2])
+                if not np.isfinite(previous_close) or previous_close <= 0:
+                    raise ValueError("Invalid previous session close")
+                latest = daily.iloc[-1]
+                change = current_price - previous_close
+                high, low = float(latest["High"]), float(latest["Low"])
+                if not np.isfinite(high) or not np.isfinite(low):
+                    raise ValueError("Invalid session high/low")
+                volume = latest.get("Volume", 0)
+                result = MarketData(
+                    symbol="HG=F", price=round(current_price, 4),
+                    change=round(change, 4),
+                    change_percent=round(change / previous_close * 100, 2),
+                    high=round(max(high, current_price), 4),
+                    low=round(min(low, current_price), 4),
+                    volume=f"{int(volume):,}" if pd.notna(volume) and volume > 0 else "N/A",
+                    timestamp=quote_time.isoformat(),
+                )
+                self._last_copper = result
+            except Exception as exc:
+                logger.warning("Copper quote unavailable: %s", exc)
+                result = self._get_fallback_copper_data()
+            self._copper_result = result
+            self._copper_checked = time.monotonic()
+            return result
 
-            # Intraday history with broader window to reduce empties
-            hist = copper.history(period="5d", interval="1m")
-            if hist.empty:
-                hist = copper.history(period="5d", interval="5m")
-            if hist.empty:
-                hist = copper.history(period="1mo", interval="1h")
-            if hist.empty:
-                # Fallback to daily data
-                hist = copper.history(period="5d")
-
-            # Determine current and previous prices
-            if not hist.empty:
-                current_price = float(hist['Close'].iloc[-1])
-                previous_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current_price
-            elif fast_info_price is not None:
-                current_price = fast_info_price
-                previous_close = fast_info_price
-            else:
-                # As a last resort, use fallback
-                return self._get_fallback_copper_data()
-            
-            change = current_price - previous_close
-            change_percent = (change / previous_close) * 100 if previous_close != 0 else 0
-            
-            # Get additional data
-            volume = hist['Volume'].iloc[-1] if (not hist.empty and 'Volume' in hist.columns) else 0
-            high = float(hist['High'].max()) if not hist.empty else current_price
-            low = float(hist['Low'].min()) if not hist.empty else current_price
-            
-            market_data = MarketData(
-                symbol="HG=F",
-                price=round(float(current_price), 4),
-                change=round(float(change), 4),
-                change_percent=round(float(change_percent), 2),
-                volume=f"{int(volume):,}" if volume > 0 else "N/A",
-                high=round(float(high), 4),
-                low=round(float(low), 4),
-                timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                market_cap=info.get('marketCap'),
-                pe_ratio=info.get('trailingPE')
-            )
-            
-            logger.info(f"📈 Live copper price: ${current_price:.4f} ({change_percent:+.2f}%)")
-            return market_data
-            
-        except Exception as e:
-            logger.error(f"❌ Error fetching live copper price: {e}")
-            # Return fallback data
-            return self._get_fallback_copper_data()
-    
     def get_related_commodities(self) -> Dict[str, MarketData]:
         """
         Get prices for related commodities
@@ -297,23 +283,15 @@ class RealTimeDataService:
     
     def _get_fallback_copper_data(self) -> MarketData:
         """Fallback copper data when API fails"""
-        base_price = 5.84
-        variation = np.random.normal(0, 0.02)
-        price = base_price + variation
-        change = variation
-        change_percent = (change / base_price) * 100
-        
+        if self._last_copper is not None:
+            return replace(self._last_copper, status="stale")
+        # Preserve numeric compatibility for model consumers, explicitly labeled as demo.
         return MarketData(
-            symbol="HG=F",
-            price=price,
-            change=change,
-            change_percent=change_percent,
-            volume="15,234",
-            high=price + 0.05,
-            low=price - 0.05,
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            symbol="HG=F", price=5.84, change=0.0, change_percent=0.0,
+            volume="N/A", high=5.84, low=5.84, timestamp="Unavailable",
+            source="Demo", status="unavailable",
         )
-    
+
     def _get_simulated_economic_indicators(self) -> List[EconomicIndicator]:
         """Simulated economic indicators when FRED API not available"""
         base_indicators = [
@@ -398,6 +376,7 @@ class WebSocketServer:
         
     async def register_client(self, websocket, path):
         """Register a new WebSocket client"""
+        import websockets
         self.clients.add(websocket)
         logger.info(f"📡 Client connected. Total clients: {len(self.clients)}")
         
@@ -461,6 +440,7 @@ class WebSocketServer:
     
     def start_server(self):
         """Start the WebSocket server"""
+        import websockets
         self.running = True
         
         async def run_server():
@@ -486,7 +466,7 @@ def get_live_copper_price() -> Dict[str, Any]:
     try:
         data = real_time_service.get_copper_price_live()
         return {
-            'success': True,
+            'success': data.status != 'unavailable',
             'data': data.__dict__
         }
     except Exception as e:
