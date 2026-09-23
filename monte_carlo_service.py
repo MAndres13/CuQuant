@@ -1,279 +1,208 @@
+"""Daily copper price scenarios with historical calibration and rolling validation.
+
+These are price distributions, not futures account P&L: rolls, margin, fees and
+leverage are excluded. HG=F is Yahoo's rolling front-contract series.
 """
-Monte Carlo Simulation Service for CopperFlow Analytics
-"""
+import logging
+import threading
+import time
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 import yfinance as yf
-from datetime import datetime, timedelta
-import json
-import logging
 
 logger = logging.getLogger(__name__)
+MODELS = ('ensemble', 'gaussian', 'bootstrap')
+HORIZONS = (1, 5, 21, 63, 126, 252)
+
+
+class DataUnavailable(RuntimeError):
+    pass
+
+
+def integer(value, name, low, high):
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or not low <= value <= high:
+        raise ValueError(f'{name} must be an integer from {low} to {high}')
+    return int(value)
+
 
 class MonteCarloSimulator:
-    """
-    Advanced Monte Carlo simulation for commodity price forecasting.
-    """
-    
     def __init__(self):
-        self.historical_data = {}
-        self.simulation_cache = {}
-    
-    def fetch_historical_data(self, symbol='HG=F', period='1y'):
-        """
-        Fetch historical price data for Monte Carlo simulation.
-        """
-        try:
-            ticker = yf.Ticker(symbol)
-            data = ticker.history(period=period)
-            
-            if data.empty:
-                logger.warning(f"No data found for {symbol}")
-                return None
-            
-            # Calculate daily returns
-            data['Returns'] = data['Close'].pct_change().dropna()
-            
-            self.historical_data[symbol] = data
-            return data
-            
-        except Exception as e:
-            logger.error(f"Error fetching historical data for {symbol}: {e}")
-            return None
-    
-    def calculate_volatility_parameters(self, symbol='HG=F'):
-        """
-        Calculate volatility parameters for Monte Carlo simulation.
-        """
-        if symbol not in self.historical_data:
-            self.fetch_historical_data(symbol)
-        
-        data = self.historical_data.get(symbol)
-        if data is None or data.empty:
-            # Use default parameters if no data available
-            return {
-                'mean_return': 0.0005,  # 0.05% daily return
-                'volatility': 0.025,    # 2.5% daily volatility
-                'drift': 0.0002
-            }
-        
-        returns = data['Returns'].dropna()
-        
-        # Calculate parameters
-        mean_return = returns.mean()
-        volatility = returns.std()
-        drift = mean_return - (volatility ** 2) / 2
-        
-        return {
-            'mean_return': mean_return,
-            'volatility': volatility,
-            'drift': drift,
-            'skewness': stats.skew(returns),
-            'kurtosis': stats.kurtosis(returns)
-        }
-    
-    def run_monte_carlo_simulation(self, 
-                                 current_price=5.84,
-                                 days=252,  # 1 year
-                                 n_simulations=1000,
-                                 symbol='HG=F'):
-        """
-        Run Monte Carlo simulation for price forecasting.
-        """
-        logger.info(f"Running Monte Carlo simulation: {n_simulations} paths, {days} days")
-        
-        # Get volatility parameters
-        params = self.calculate_volatility_parameters(symbol)
-        
-        # Initialize arrays
-        dt = 1/252  # Daily time step
-        price_paths = np.zeros((n_simulations, days + 1))
-        price_paths[:, 0] = current_price
-        
-        # Generate random shocks
-        np.random.seed(42)  # For reproducible results
-        random_shocks = np.random.normal(0, 1, (n_simulations, days))
-        
-        # Simulate price paths using Geometric Brownian Motion
-        for t in range(1, days + 1):
-            price_paths[:, t] = price_paths[:, t-1] * np.exp(
-                (params['drift']) * dt + 
-                params['volatility'] * np.sqrt(dt) * random_shocks[:, t-1]
-            )
-        
-        # Calculate statistics
-        final_prices = price_paths[:, -1]
-        
-        results = {
-            'simulation_params': {
-                'current_price': current_price,
-                'days': days,
-                'n_simulations': n_simulations,
-                'mean_return': params['mean_return'],
-                'volatility': params['volatility'],
-                'drift': params['drift']
-            },
-            'price_paths': price_paths.tolist(),
-            'final_prices': final_prices.tolist(),
-            'statistics': {
-                'mean_final_price': float(np.mean(final_prices)),
-                'median_final_price': float(np.median(final_prices)),
-                'std_final_price': float(np.std(final_prices)),
-                'min_price': float(np.min(final_prices)),
-                'max_price': float(np.max(final_prices)),
-                'var_95': float((current_price - np.percentile(final_prices, 5)) / current_price),  # VaR as percentage loss
-                'var_99': float((current_price - np.percentile(final_prices, 1)) / current_price),  # VaR as percentage loss
-                'probability_profit': float(np.mean(final_prices > current_price)),
-                'expected_return': float((np.mean(final_prices) - current_price) / current_price),
-                'percentiles': {
-                    '10th': float(np.percentile(final_prices, 10)),
-                    '25th': float(np.percentile(final_prices, 25)),
-                    '75th': float(np.percentile(final_prices, 75)),
-                    '90th': float(np.percentile(final_prices, 90))
-                }
-            },
-            'risk_metrics': self.calculate_risk_metrics(price_paths, current_price),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # Cache results
-        cache_key = f"{symbol}_{current_price}_{days}_{n_simulations}"
-        self.simulation_cache[cache_key] = results
-        
-        return results
-    
-    def calculate_risk_metrics(self, price_paths, initial_price):
-        """
-        Calculate comprehensive risk metrics from simulation results.
-        """
-        # Calculate returns for each path
-        returns = (price_paths[:, -1] - initial_price) / initial_price
-        
-        # Maximum drawdown calculation
-        max_drawdowns = []
-        for path in price_paths:
-            running_max = np.maximum.accumulate(path)
-            drawdowns = (path - running_max) / running_max
-            max_drawdowns.append(np.min(drawdowns))
-        
-        return {
-            'value_at_risk': {
-                '95%': float(np.percentile(returns, 5)),
-                '99%': float(np.percentile(returns, 1)),
-                '99.9%': float(np.percentile(returns, 0.1))
-            },
-            'conditional_var': {
-                '95%': float(np.mean(returns[returns <= np.percentile(returns, 5)])),
-                '99%': float(np.mean(returns[returns <= np.percentile(returns, 1)]))
-            },
-            'maximum_drawdown': {
-                'mean': float(np.mean(max_drawdowns)),
-                'worst': float(np.min(max_drawdowns)),
-                '95th_percentile': float(np.percentile(max_drawdowns, 5))
-            },
-            'sharpe_ratio': float(np.mean(returns) / np.std(returns)) if np.std(returns) > 0 else 0,
-            'sortino_ratio': self.calculate_sortino_ratio(returns),
-            'probability_of_loss': float(np.mean(returns < 0))
-        }
-    
-    def calculate_sortino_ratio(self, returns, target_return=0):
-        """
-        Calculate Sortino ratio (downside deviation).
-        """
-        downside_returns = returns[returns < target_return]
-        if len(downside_returns) == 0:
-            return float('inf')
-        
-        downside_deviation = np.std(downside_returns)
-        if downside_deviation == 0:
-            return float('inf')
-        
-        return float((np.mean(returns) - target_return) / downside_deviation)
-    
-    def get_simulation_summary(self, results):
-        """
-        Generate a human-readable summary of simulation results.
-        """
-        stats = results['statistics']
-        risk = results['risk_metrics']
-        
-        summary = {
-            'title': 'Monte Carlo Price Simulation Results',
-            'key_insights': [
-                f"Expected price in {results['simulation_params']['days']} days: ${stats['mean_final_price']:.2f}",
-                f"Probability of profit: {stats['probability_profit']:.1%}",
-                f"95% Value at Risk: {risk['value_at_risk']['95%']:.1%}",
-                f"Maximum expected drawdown: {risk['maximum_drawdown']['worst']:.1%}"
-            ],
-            'price_range': {
-                'optimistic': stats['percentiles']['90th'],
-                'expected': stats['mean_final_price'],
-                'pessimistic': stats['percentiles']['10th']
-            },
-            'risk_assessment': self.assess_risk_level(risk),
-            'recommendation': self.generate_recommendation(stats, risk)
-        }
-        
-        return summary
-    
-    def assess_risk_level(self, risk_metrics):
-        """
-        Assess overall risk level based on metrics.
-        """
-        var_95 = abs(risk_metrics['value_at_risk']['95%'])
-        max_dd = abs(risk_metrics['maximum_drawdown']['worst'])
-        
-        if var_95 > 0.2 or max_dd > 0.3:
-            return 'High Risk'
-        elif var_95 > 0.1 or max_dd > 0.15:
-            return 'Medium Risk'
-        else:
-            return 'Low Risk'
-    
-    def generate_recommendation(self, stats, risk_metrics):
-        """
-        Generate trading recommendation based on simulation results.
-        """
-        prob_profit = stats['probability_profit']
-        expected_return = stats['expected_return']
-        sharpe_ratio = risk_metrics['sharpe_ratio']
-        
-        if prob_profit > 0.6 and expected_return > 0.05 and sharpe_ratio > 0.5:
-            return 'Strong Buy - Favorable risk/reward profile'
-        elif prob_profit > 0.55 and expected_return > 0.02:
-            return 'Buy - Positive expected return with acceptable risk'
-        elif prob_profit < 0.4 or expected_return < -0.05:
-            return 'Sell - Unfavorable risk/reward profile'
-        else:
-            return 'Hold - Neutral outlook with balanced risk/reward'
+        self._history = None
+        self._history_at = float('-inf')
+        self._lock = threading.Lock()
+        self._backtests = {}
 
-# Global simulator instance
+    def fetch_historical_data(self, symbol='HG=F', period='5y'):
+        if symbol != 'HG=F' or period != '5y':
+            raise ValueError('This model is calibrated for HG=F over five years')
+        with self._lock:
+            if self._history is not None and time.monotonic() - self._history_at < 3600:
+                return self._history.copy()
+            try:
+                data = yf.Ticker(symbol).history(period=period, interval='1d', auto_adjust=False, timeout=15)
+                close = pd.to_numeric(data['Close'], errors='coerce').sort_index()
+                close = close[~close.index.duplicated(keep='last')]
+                # Reject bad observations instead of bridging missing trading sessions.
+                if len(close) < 505 or not np.isfinite(close).all() or (close <= 0).any():
+                    raise ValueError('Need at least 505 valid positive daily closes')
+                age = pd.Timestamp.now(tz='UTC') - pd.Timestamp(close.index[-1]).tz_convert('UTC')
+                if age > pd.Timedelta(days=7):
+                    raise ValueError('Historical prices are more than seven days old')
+                self._history = close
+                self._history_at = time.monotonic()
+                self._backtests.clear()
+                return close.copy()
+            except Exception as exc:
+                raise DataUnavailable(f'Copper history unavailable: {exc}') from exc
+
+    @staticmethod
+    def parameters(returns):
+        returns = np.asarray(returns, dtype=float)
+        if len(returns) < 252 or not np.isfinite(returns).all():
+            raise DataUnavailable('At least 252 finite daily log returns are required')
+        long_var = float(np.var(returns, ddof=1))
+        if long_var <= 0:
+            raise DataUnavailable('Historical returns have zero variance')
+        centered = returns - returns.mean()
+        variance = long_var
+        for value in centered:
+            variance = .94 * variance + .06 * value * value
+        return {'daily_volatility': float(np.sqrt(long_var)),
+                'recent_daily_volatility': float(np.sqrt(variance)),
+                'historical_daily_log_return': float(returns.mean())}
+
+    def paths(self, returns, price, days, count, model, rng):
+        params = self.parameters(returns)
+        sigma = params['daily_volatility']
+        # Neutral log drift avoids extrapolating a noisy historical trend for years.
+        # Each step is ONE trading day; daily volatility is not divided by sqrt(252).
+        if model == 'ensemble':
+            split = count // 2
+            return np.concatenate((self.paths(returns, price, days, split, 'gaussian', rng),
+                                   self.paths(returns, price, days, count-split, 'bootstrap', rng)))
+        if model == 'gaussian':
+            shocks = rng.normal(0, sigma, (count, days))
+        else:
+            # Resample contiguous five-day blocks, preserving local clustering/tails.
+            centered = np.asarray(returns) - np.mean(returns)
+            starts = rng.integers(0, len(centered)-4, (count, (days+4)//5))
+            indices = (starts[..., None] + np.arange(5)).reshape(count, -1)[:, :days]
+            shocks = centered[indices]
+            # Recent volatility decays toward the long-run estimate (21-day half-life).
+            weight = np.exp(-np.log(2)*np.arange(days)/21)
+            variance = sigma**2 + (params['recent_daily_volatility']**2-sigma**2)*weight
+            shocks = shocks * np.sqrt(variance)[None, :] / sigma
+        logs = np.concatenate((np.zeros((count, 1)), np.cumsum(shocks, axis=1)), axis=1)
+        with np.errstate(over='raise', invalid='raise'):
+            return price * np.exp(logs)
+
+    @staticmethod
+    def statistics(values, price):
+        returns = values / price - 1
+        losses = -returns
+        var95, var99 = np.quantile(losses, [.95, .99])
+        return {
+            'mean_final_price': float(values.mean()), 'median_final_price': float(np.median(values)),
+            'std_final_price': float(values.std()), 'min_price': float(values.min()), 'max_price': float(values.max()),
+            'var_95': float(max(0, var95)), 'var_99': float(max(0, var99)),
+            'expected_shortfall_95': float(max(0, losses[losses >= var95].mean())),
+            'probability_profit': float(np.mean(returns > 0)),
+            'probability_loss_10pct': float(np.mean(returns < -.1)),
+            'expected_return': float(returns.mean()),
+            'percentiles': {f'{q}th': float(np.percentile(values, q)) for q in (5, 10, 25, 50, 75, 90, 95)},
+        }
+
+    def backtest(self, closes):
+        key = (str(closes.index[-1]), len(closes), float(closes.iloc[-1]))
+        with self._lock:
+            if key in self._backtests:
+                return self._backtests[key]
+        returns = np.diff(np.log(closes.to_numpy()))
+        report = []
+        for horizon in HORIZONS:
+            # Non-overlapping outcomes, up to 20 recent origins, with 252-day training minimum.
+            origins = list(range(len(closes)-1-horizon, 251, -horizon))[:20][::-1]
+            for model in MODELS:
+                covered, widths, errors, baseline, scores = [], [], [], [], []
+                for origin in origins:
+                    train = returns[max(0, origin-756):origin]
+                    samples = self.paths(train, 1., horizon, 600, model,
+                                         np.random.default_rng(1000+origin+horizon))[:, -1]
+                    lo, median, hi = np.quantile(samples, [.05, .5, .95])
+                    actual = float(closes.iloc[origin+horizon] / closes.iloc[origin])
+                    covered.append(lo <= actual <= hi)
+                    widths.append(hi-lo)
+                    errors.append(abs(median-actual))
+                    baseline.append(abs(1-actual))
+                    scores.append(hi-lo + 20*max(lo-actual, 0) + 20*max(actual-hi, 0))
+                report.append({'days': horizon, 'model': model, 'origins': len(origins),
+                               'coverage_90': float(np.mean(covered)),
+                               'mean_interval_width': float(np.mean(widths)),
+                               'interval_score': float(np.mean(scores)),
+                               'median_absolute_error': float(np.mean(errors)),
+                               'unchanged_price_error': float(np.mean(baseline)),
+                               'limited_sample': len(origins) < 10})
+        result = {'method': 'Rolling origins; training data precede each outcome; non-overlapping outcomes per horizon. 600 paths per origin.',
+                  'target_coverage': .9, 'results': report,
+                  'note': 'Diagnostic only; no model is selected using these test results. Long horizons have few independent observations.'}
+        with self._lock:
+            self._backtests[key] = result
+        return result
+
+    def run_monte_carlo_simulation(self, current_price=None, days=63, n_simulations=2000,
+                                   symbol='HG=F', model='ensemble', seed=42):
+        days = integer(days, 'days', 1, 252)
+        count = integer(n_simulations, 'n_simulations', 500, 5000)
+        seed = integer(seed, 'seed', 0, 2**32-1)
+        if model not in MODELS:
+            raise ValueError('model must be ensemble, gaussian, or bootstrap')
+        if isinstance(current_price, bool) or not isinstance(current_price, (float, int)) or not np.isfinite(current_price) or current_price <= 0:
+            raise ValueError('current_price must be a finite positive number')
+        closes = self.fetch_historical_data(symbol)
+        returns = np.diff(np.log(closes.to_numpy()))[-756:]
+        price_paths = self.paths(returns, current_price, max(days, 252), count, model, np.random.default_rng(seed))
+        stats = self.statistics(price_paths[:, days], current_price)
+        selected = price_paths[:, :days+1]
+        drawdowns = 1 - selected / np.maximum.accumulate(selected, axis=1)
+        levels = (5, 25, 50, 75, 95)
+        bands = np.percentile(selected, levels, axis=0)
+        return {'simulation_params': {'current_price': current_price, 'days': days, 'n_simulations': count,
+                                      'model': model, 'seed': seed, 'drift': 0., **self.parameters(returns)},
+                'statistics': stats,
+                'risk_metrics': {'mean_maximum_drawdown': float(drawdowns.max(axis=1).mean()),
+                                 'drawdown_95': float(np.quantile(drawdowns.max(axis=1), .95))},
+                'fan_chart': {'days': list(range(days+1)), **{f'p{q}': bands[i].tolist() for i, q in enumerate(levels)}},
+                'horizons': [{'days': h, **self.statistics(price_paths[:, h], current_price)} for h in HORIZONS],
+                'backtest': self.backtest(closes),
+                'data_quality': {'symbol': symbol, 'source': 'Yahoo Finance daily closes',
+                                 'history_start': str(closes.index[0]), 'history_end': str(closes.index[-1]),
+                                 'calibration_returns': len(returns), 'history_observations': len(closes)},
+                'limitations': ['Zero mean log-return assumption; mean prices can rise due to dispersion.',
+                               'HG=F can contain contract-roll discontinuities. These are retained, not treated as verified spot returns.',
+                               'Bands describe model uncertainty; they do not guarantee coverage or include fees, margin, leverage or roll costs.',
+                               'The ensemble mixes equal numbers of Gaussian and historical-block paths. This is not an accuracy claim.'],
+                'timestamp': datetime.now(timezone.utc).isoformat()}
+
+    @staticmethod
+    def get_simulation_summary(results):
+        stats = results['statistics']
+        return {'risk_assessment': 'High' if stats['var_95'] > .2 else 'Medium' if stats['var_95'] > .1 else 'Low',
+                'recommendation': 'Scenario analysis, not a buy/sell signal. Compare coverage and error against the unchanged-price baseline.',
+                'price_range': {'pessimistic': stats['percentiles']['5th'], 'expected': stats['median_final_price'],
+                                'optimistic': stats['percentiles']['95th']}}
+
+
 monte_carlo_simulator = MonteCarloSimulator()
 
-def run_simulation_api(current_price=5.84, days=252, n_simulations=1000):
-    """
-    API endpoint function for running Monte Carlo simulation.
-    """
+
+def run_simulation_api(current_price=None, days=63, n_simulations=2000, model='ensemble', seed=42):
     try:
-        results = monte_carlo_simulator.run_monte_carlo_simulation(
-            current_price=current_price,
-            days=days,
-            n_simulations=n_simulations
-        )
-        
-        summary = monte_carlo_simulator.get_simulation_summary(results)
-        
-        return {
-            'success': True,
-            'results': results,
-            'summary': summary
-        }
-        
-    except Exception as e:
-        logger.error(f"Error running Monte Carlo simulation: {e}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
+        results = monte_carlo_simulator.run_monte_carlo_simulation(current_price, days, n_simulations, model=model, seed=seed)
+        return {'success': True, 'results': results, 'summary': monte_carlo_simulator.get_simulation_summary(results)}
+    except ValueError as exc:
+        return {'success': False, 'error': str(exc), 'error_type': 'validation'}
+    except Exception as exc:
+        logger.exception('Monte Carlo simulation failed')
+        return {'success': False, 'error': str(exc), 'error_type': 'unavailable'}
