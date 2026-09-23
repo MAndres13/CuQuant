@@ -941,123 +941,48 @@ def handle_request_update():
         logger.error(traceback.format_exc())
 
 # Monte Carlo Simulation API
+def simulation_response(data):
+    if not monte_carlo_available:
+        return {'success': False, 'error': 'Simulation service unavailable'}, 503
+    if not isinstance(data, dict):
+        return {'success': False, 'error': 'Expected a JSON object'}, 400
+    price = data.get('current_price')
+    quote = None
+    if price is None:
+        quote = get_latest_copper_price()
+        if quote.get('status') != 'available' or quote.get('source') != 'Yahoo Finance':
+            return {'success': False, 'error': 'A current Yahoo quote is unavailable. Retry later or enter an explicit scenario price.'}, 503
+        price = quote['price']
+    result = run_simulation_api(price, data.get('days', 63), data.get('n_simulations', 2000),
+                                model=data.get('model', 'ensemble'), seed=data.get('seed', 42))
+    if result['success']:
+        result['results']['data_quality']['starting_price_source'] = 'Yahoo Finance' if quote else 'User scenario'
+        result['results']['data_quality']['quote_timestamp'] = quote.get('timestamp') if quote else None
+        return result, 200
+    return result, 400 if result.get('error_type') == 'validation' else 503
+
+
 @app.route('/api/monte_carlo', methods=['POST'])
 def monte_carlo_simulation():
-    """Run Monte Carlo simulation for price forecasting."""
-    if not monte_carlo_available:
-        # Return fallback simulation data instead of error
-        fallback_results = {
-            'success': True,
-            'results': {
-                'statistics': {
-                    'mean_final_price': 6.12,
-                    'std_dev': 0.45,
-                    'min_price': 4.89,
-                    'max_price': 7.34,
-                    'probability_profit': 0.68,
-                    'var_95': 5.23,
-                    'expected_return': 0.048
-                },
-                'simulation_paths': []
-            },
-            'summary': {
-                'recommendation': 'Moderate Buy',
-                'risk_assessment': 'Medium',
-                'confidence_interval': '5.67 - 6.57',
-                'expected_volatility': '7.7%'
-            }
-        }
-        return jsonify(fallback_results)
-    
-    try:
-        data = request.get_json() or {}
-        current_price = data.get('current_price', 5.84)
-        days = data.get('days', 252)
-        n_simulations = data.get('n_simulations', 1000)
-        
-        logger.info(f"Running Monte Carlo simulation: price={current_price}, days={days}, sims={n_simulations}")
-        
-        results = run_simulation_api(current_price, days, n_simulations)
-        return jsonify(results)
-        
-    except Exception as e:
-        logger.error(f"Error in Monte Carlo simulation API: {e}")
-        # Return fallback data instead of error
-        fallback_results = {
-            'success': True,
-            'results': {
-                'statistics': {
-                    'mean_final_price': 6.12,
-                    'std_dev': 0.45,
-                    'min_price': 4.89,
-                    'max_price': 7.34,
-                    'probability_profit': 0.68,
-                    'var_95': 5.23,
-                    'expected_return': 0.048
-                },
-                'simulation_paths': []
-            },
-            'summary': {
-                'recommendation': 'Moderate Buy',
-                'risk_assessment': 'Medium',
-                'confidence_interval': '5.67 - 6.57',
-                'expected_volatility': '7.7%'
-            }
-        }
-        return jsonify(fallback_results)
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({'success': False, 'error': 'Expected a JSON object'}), 400
+    result, status = simulation_response(data)
+    return jsonify(result), status
 
-# Quick simulation endpoint for dashboard
+
 @app.route('/api/quick_simulation')
 def quick_simulation():
-    """Quick Monte Carlo simulation with current price."""
-    if not monte_carlo_available:
-        # Return fallback quick simulation data
-        return jsonify({
-            'success': True,
-            'current_price': 5.84,
-            'expected_price_90d': 6.12,
-            'probability_profit': 0.68,
-            'var_95': 5.23,
-            'recommendation': 'Moderate Buy',
-            'risk_level': 'Medium'
-        })
-    
-    try:
-        current_price_data = get_latest_copper_price()
-        current_price = current_price_data.get('price', 5.84)
-        
-        # Run quick simulation (fewer simulations for speed)
-        results = run_simulation_api(current_price, days=90, n_simulations=500)
-        
-        if results['success']:
-            # Return simplified results for dashboard display
-            stats = results['results']['statistics']
-            summary = results['summary']
-            
-            return jsonify({
-                'success': True,
-                'current_price': current_price,
-                'expected_price_90d': stats['mean_final_price'],
-                'probability_profit': stats['probability_profit'],
-                'var_95': stats['var_95'],
-                'recommendation': summary['recommendation'],
-                'risk_level': summary['risk_assessment']
-            })
-        else:
-            return jsonify(results)
-            
-    except Exception as e:
-        logger.error(f"Error in quick simulation: {e}")
-        # Return fallback data instead of error
-        return jsonify({
-            'success': True,
-            'current_price': 5.84,
-            'expected_price_90d': 6.12,
-            'probability_profit': 0.68,
-            'var_95': 5.23,
-            'recommendation': 'Moderate Buy',
-            'risk_level': 'Medium'
-        })
+    result, status = simulation_response({'days': 90, 'n_simulations': 500})
+    if not result['success']:
+        return jsonify(result), status
+    stats = result['results']['statistics']
+    return jsonify({'success': True,
+                    'current_price': result['results']['simulation_params']['current_price'],
+                    'expected_price_90d': stats['mean_final_price'],
+                    'probability_profit': stats['probability_profit'], 'var_95': stats['var_95'],
+                    'recommendation': result['summary']['recommendation'],
+                    'risk_level': result['summary']['risk_assessment']})
 
 # Real-time data API endpoints
 @app.route('/api/live-market-data')
